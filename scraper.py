@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Scrape events from the City of North Vancouver website and write normalized JSON.
+Scrape City of North Vancouver events into dashboard-ready JSON.
 
 Usage:
-  python scraper.py --output data/events.json
+  python scraper.py --output events.json
 """
 
 from __future__ import annotations
@@ -12,8 +12,10 @@ import argparse
 import json
 import logging
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -24,8 +26,12 @@ from urllib3.util.retry import Retry
 
 
 DEFAULT_BASE_URL = "https://www.cnv.org"
-DEFAULT_EVENTS_PATH = "/Parks-Recreation-and-Culture/Events"
+DEFAULT_EVENTS_PATH = "/parks-recreation/events"
 DEFAULT_TIMEOUT = 25
+KNOWN_FEED_URLS = [
+    "https://www.trumba.com/calendars/city-of-north-vancouver-community-events.json",
+    "https://www.trumba.com/calendars/city-of-north-vancouver-community-events.rss",
+]
 
 
 @dataclass(slots=True)
@@ -53,9 +59,10 @@ def make_session() -> requests.Session:
     session.headers.update(
         {
             "User-Agent": (
-                "north-van-events-scraper/1.0 "
+                "north-van-events-scraper/1.1 "
                 "(https://github.com/your-org/north-van-events)"
-            )
+            ),
+            "Accept": "text/html,application/json,application/xml,text/xml;q=0.9,*/*;q=0.8",
         }
     )
     session.mount("https://", adapter)
@@ -76,9 +83,9 @@ def parse_date(value: str | None) -> str | None:
     if not raw:
         return None
 
-    raw = raw.replace("Z", "+00:00")
+    normalized = raw.replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(raw)
+        dt = datetime.fromisoformat(normalized)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
@@ -88,6 +95,8 @@ def parse_date(value: str | None) -> str | None:
     patterns = (
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
+        "%Y%m%dT%H%M%S",
+        "%Y%m%d",
         "%B %d, %Y %I:%M %p",
         "%B %d, %Y",
         "%b %d, %Y %I:%M %p",
@@ -100,6 +109,14 @@ def parse_date(value: str | None) -> str | None:
             return dt.isoformat()
         except ValueError:
             continue
+
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except (TypeError, ValueError):
+        pass
     return None
 
 
@@ -107,7 +124,7 @@ def is_probably_event_url(url: str | None) -> bool:
     if not url:
         return False
     path = urlparse(url).path.lower()
-    return "event" in path or "calendar" in path
+    return any(token in path for token in ("event", "events", "calendar"))
 
 
 def _iter_json_nodes(node: Any):
@@ -118,6 +135,40 @@ def _iter_json_nodes(node: Any):
     elif isinstance(node, list):
         for item in node:
             yield from _iter_json_nodes(item)
+
+
+def fetch_text(session: requests.Session, url: str, timeout: int) -> str | None:
+    try:
+        response = session.get(url, timeout=timeout)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logging.warning("Fetch failed for %s: %s", url, exc)
+        return None
+    return response.text
+
+
+def pick_first_dict_value(node: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        if key in node and node[key] not in (None, ""):
+            return node[key]
+    return None
+
+
+def text_from_maybe_dict(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("name", "title", "label", "address", "value", "text"):
+            if key in value:
+                nested = text_from_maybe_dict(value[key])
+                if nested:
+                    return nested
+        return clean_text(json.dumps(value, ensure_ascii=False))
+    if isinstance(value, list):
+        parts = [clean_text(text_from_maybe_dict(item)) for item in value]
+        joined = ", ".join(part for part in parts if part)
+        return clean_text(joined)
+    if isinstance(value, str):
+        return clean_text(value)
+    return clean_text(str(value)) if value is not None else None
 
 
 def extract_json_ld_events(soup: BeautifulSoup, page_url: str) -> list[Event]:
@@ -156,13 +207,214 @@ def extract_json_ld_events(soup: BeautifulSoup, page_url: str) -> list[Event]:
                     title=clean_text(node.get("name")) or "Untitled Event",
                     start=parse_date(node.get("startDate")),
                     end=parse_date(node.get("endDate")),
-                    location=clean_text(loc_text),
+                    location=clean_text(text_from_maybe_dict(loc_text)),
                     summary=clean_text(node.get("description")),
                     category=clean_text(node.get("eventStatus")),
                     url=url if isinstance(url, str) else None,
                     source="json-ld",
                 )
             )
+    return events
+
+
+def parse_trumba_json(text: str, source_url: str) -> list[Event]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    events: list[Event] = []
+    for node in _iter_json_nodes(payload):
+        if not isinstance(node, dict):
+            continue
+        title = text_from_maybe_dict(
+            pick_first_dict_value(node, ["title", "name", "eventTitle"])
+        )
+        if not title:
+            continue
+
+        start_raw = pick_first_dict_value(
+            node,
+            [
+                "start",
+                "startDate",
+                "startDateTime",
+                "localStartDateTime",
+                "eventDate",
+                "date",
+            ],
+        )
+        end_raw = pick_first_dict_value(
+            node,
+            ["end", "endDate", "endDateTime", "localEndDateTime"],
+        )
+        link_raw = pick_first_dict_value(node, ["url", "link", "eventUrl", "detailUrl"])
+        category_raw = pick_first_dict_value(
+            node, ["category", "categories", "calendar", "calendarName"]
+        )
+        location_raw = pick_first_dict_value(
+            node, ["location", "where", "venue", "address", "locationName"]
+        )
+        summary_raw = pick_first_dict_value(
+            node, ["description", "summary", "body", "details"]
+        )
+
+        url = (
+            urljoin(source_url, str(link_raw))
+            if isinstance(link_raw, str) and link_raw.strip()
+            else None
+        )
+        events.append(
+            Event(
+                title=title,
+                start=parse_date(text_from_maybe_dict(start_raw)),
+                end=parse_date(text_from_maybe_dict(end_raw)),
+                location=text_from_maybe_dict(location_raw),
+                summary=text_from_maybe_dict(summary_raw),
+                category=text_from_maybe_dict(category_raw),
+                url=url,
+                source="trumba-json",
+            )
+        )
+    return events
+
+
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower() if "}" in tag else tag.lower()
+
+
+def find_first_text_by_local_names(item: ET.Element, names: set[str]) -> str | None:
+    for child in item.iter():
+        if local_name(child.tag) in names:
+            text = clean_text(" ".join(child.itertext()))
+            if text:
+                return text
+    return None
+
+
+def parse_rss_description_fields(description: str | None) -> tuple[str | None, str | None]:
+    if not description:
+        return (None, None)
+    plain = BeautifulSoup(description, "html.parser").get_text("\n", strip=True)
+    when_match = re.search(r"(?im)^when:\s*(.+)$", plain)
+    where_match = re.search(r"(?im)^where:\s*(.+)$", plain)
+    if not where_match:
+        at_match = re.search(r"(?im)\s@\s*([^\n]+)$", plain)
+        where_match = at_match
+    return (
+        clean_text(when_match.group(1)) if when_match else None,
+        clean_text(where_match.group(1)) if where_match else None,
+    )
+
+
+def parse_start_from_description(description: str | None) -> str | None:
+    if not description:
+        return None
+    plain = BeautifulSoup(description, "html.parser").get_text(" ", strip=True)
+    plain = clean_text(plain)
+    if not plain:
+        return None
+
+    # Example: "Wednesday, February 18, 2026, 6:00 PM - 8:00 PM @ ..."
+    dt_match = re.search(
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s*"
+        r"([A-Za-z]+ \d{1,2}, \d{4})(?:,\s*([0-9]{1,2}:[0-9]{2}\s*[AP]M))?",
+        plain,
+        flags=re.IGNORECASE,
+    )
+    if dt_match:
+        date_part = dt_match.group(1)
+        time_part = dt_match.group(2)
+        candidate = f"{date_part} {time_part}" if time_part else date_part
+        parsed = parse_date(candidate)
+        if parsed:
+            return parsed
+
+    date_only_match = re.search(r"\b([A-Za-z]+ \d{1,2}, \d{4})\b", plain)
+    if date_only_match:
+        return parse_date(date_only_match.group(1))
+    return None
+
+
+def parse_start_from_link(link: str | None) -> str | None:
+    if not link:
+        return None
+    match = re.search(r"(?:[?&]date=)(\d{8})", link)
+    if not match:
+        return None
+    value = match.group(1)
+    return parse_date(value)
+
+
+def parse_trumba_rss(text: str, source_url: str) -> list[Event]:
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+
+    items = list(root.findall(".//item"))
+    if not items:
+        items = list(root.findall(".//{http://www.w3.org/2005/Atom}entry"))
+
+    events: list[Event] = []
+    for item in items:
+        title = clean_text(find_first_text_by_local_names(item, {"title"}))
+        if not title:
+            continue
+
+        link = find_first_text_by_local_names(item, {"link", "url"})
+        if not link:
+            for child in item:
+                if local_name(child.tag) == "link":
+                    href = child.attrib.get("href")
+                    if href:
+                        link = href
+                        break
+
+        description = find_first_text_by_local_names(item, {"description", "summary"})
+        category = find_first_text_by_local_names(item, {"category"})
+        location = find_first_text_by_local_names(
+            item, {"location", "where", "venue", "locationname"}
+        )
+        start_text = find_first_text_by_local_names(
+            item,
+            {
+                "dtstart",
+                "start",
+                "startdate",
+                "startdatetime",
+                "eventstartdate",
+                "when",
+            },
+        )
+        end_text = find_first_text_by_local_names(
+            item, {"dtend", "end", "enddate", "enddatetime", "eventenddate"}
+        )
+
+        desc_when, desc_where = parse_rss_description_fields(description)
+        start = (
+            parse_date(start_text)
+            or parse_date(desc_when)
+            or parse_start_from_description(description)
+            or parse_start_from_link(link)
+        )
+        end = parse_date(end_text)
+        url = urljoin(source_url, link) if link else None
+
+        events.append(
+            Event(
+                title=title,
+                start=start,
+                end=end,
+                location=location or desc_where,
+                summary=clean_text(
+                    BeautifulSoup(description or "", "html.parser").get_text(" ", strip=True)
+                ),
+                category=category,
+                url=url,
+                source="trumba-rss",
+            )
+        )
     return events
 
 
@@ -178,51 +430,65 @@ def pick_text(container: Any, selectors: list[str]) -> str | None:
 
 def extract_card_events(soup: BeautifulSoup, page_url: str) -> list[Event]:
     events: list[Event] = []
-    card_candidates = soup.select(
-        ".event, .events-list-item, .calendar-item, .event-card, article, li"
+    roots = soup.select(
+        "main, #main-content, #content, .main-content, .content, .page-content, article"
     )
-    for card in card_candidates:
-        title = pick_text(card, ["h1", "h2", "h3", ".title", ".event-title", "a"])
-        link = card.select_one("a[href]")
-        href = link["href"] if link and link.has_attr("href") else None
-        url = urljoin(page_url, href) if href else None
-        if not title:
-            continue
-        if url and not is_probably_event_url(url):
-            continue
+    if not roots:
+        roots = [soup]
 
-        date_text = pick_text(
-            card,
-            [
-                "time[datetime]",
-                "time",
-                ".date",
-                ".event-date",
-                "[class*=date]",
-            ],
+    seen_cards: set[int] = set()
+    for root in roots:
+        card_candidates = root.select(
+            ".event, .events-list-item, .calendar-item, .event-card, [class*='event-'], [class*='calendar-'], article, li"
         )
-        time_el = card.select_one("time[datetime]")
-        if time_el and time_el.has_attr("datetime"):
-            start = parse_date(time_el["datetime"])
-        else:
-            start = parse_date(date_text)
+        for card in card_candidates:
+            marker = id(card)
+            if marker in seen_cards:
+                continue
+            seen_cards.add(marker)
 
-        summary = pick_text(card, [".summary", ".description", "p"])
-        location = pick_text(card, [".location", "[class*=location]", ".venue"])
-        category = pick_text(card, [".category", ".tag", "[class*=category]"])
+            title = pick_text(card, ["h1", "h2", "h3", ".title", ".event-title", "a"])
+            if not title:
+                continue
+            link = card.select_one("a[href]")
+            href = link["href"] if link and link.has_attr("href") else None
+            url = urljoin(page_url, href) if href else None
 
-        events.append(
-            Event(
-                title=title,
-                start=start,
-                end=None,
-                location=location,
-                summary=summary,
-                category=category,
-                url=url,
-                source="html-card",
+            date_text = pick_text(
+                card,
+                [
+                    "time[datetime]",
+                    "time",
+                    ".date",
+                    ".event-date",
+                    "[class*=date]",
+                ],
             )
-        )
+            time_el = card.select_one("time[datetime]")
+            if time_el and time_el.has_attr("datetime"):
+                start = parse_date(time_el["datetime"])
+            else:
+                start = parse_date(date_text)
+
+            summary = pick_text(card, [".summary", ".description", "p"])
+            location = pick_text(card, [".location", "[class*=location]", ".venue"])
+            category = pick_text(card, [".category", ".tag", "[class*=category]"])
+
+            if not (start or summary or location or (url and is_probably_event_url(url))):
+                continue
+
+            events.append(
+                Event(
+                    title=title,
+                    start=start,
+                    end=None,
+                    location=location,
+                    summary=summary,
+                    category=category,
+                    url=url if (not url or is_probably_event_url(url)) else None,
+                    source="html-card",
+                )
+            )
     return events
 
 
@@ -274,19 +540,101 @@ def sort_events(events: list[Event]) -> list[Event]:
     return sorted(events, key=sort_key)
 
 
-def scrape_events(session: requests.Session, events_url: str, timeout: int) -> list[Event]:
-    response = session.get(events_url, timeout=timeout)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+def discover_feed_urls(session: requests.Session, base_url: str, timeout: int) -> list[str]:
+    rss_page = urljoin(base_url, "/RSS")
+    text = fetch_text(session, rss_page, timeout)
+    discovered: list[str] = []
+    if not text:
+        return discovered
+    soup = BeautifulSoup(text, "html.parser")
+    for link in soup.select("a[href]"):
+        href = link.get("href")
+        if not href:
+            continue
+        full = urljoin(rss_page, href.strip())
+        parsed = urlparse(full)
+        if "trumba.com" not in parsed.netloc.lower():
+            continue
+        if full.lower().endswith((".rss", ".xml", ".json")):
+            discovered.append(full)
+    return list(dict.fromkeys(discovered))
 
-    events = []
-    events.extend(extract_json_ld_events(soup, events_url))
-    events.extend(extract_card_events(soup, events_url))
 
-    return dedupe_events(events)
+def scrape_html_page(session: requests.Session, url: str, timeout: int) -> list[Event]:
+    text = fetch_text(session, url, timeout)
+    if not text:
+        return []
+    soup = BeautifulSoup(text, "html.parser")
+    events: list[Event] = []
+    events.extend(extract_json_ld_events(soup, url))
+    events.extend(extract_card_events(soup, url))
+    return events
 
 
-def write_output(path: str, source_url: str, events: list[Event]) -> None:
+def scrape_events(
+    session: requests.Session, base_url: str, events_url: str, timeout: int
+) -> tuple[list[Event], list[str], list[str]]:
+    warnings: list[str] = []
+    sources_tried: list[str] = []
+    events: list[Event] = []
+
+    feed_urls = discover_feed_urls(session, base_url, timeout)
+    for url in KNOWN_FEED_URLS:
+        if url not in feed_urls:
+            feed_urls.append(url)
+
+    for feed_url in feed_urls:
+        sources_tried.append(feed_url)
+        text = fetch_text(session, feed_url, timeout)
+        if not text:
+            warnings.append(f"Failed to fetch feed: {feed_url}")
+            continue
+
+        parsed: list[Event] = []
+        lower_url = feed_url.lower()
+        content_starts_with_xml = text.lstrip().startswith("<?xml")
+        if lower_url.endswith(".json") and not content_starts_with_xml:
+            parsed = parse_trumba_json(text, feed_url)
+            if not parsed:
+                parsed = parse_trumba_rss(text, feed_url)
+        else:
+            parsed = parse_trumba_rss(text, feed_url)
+            if not parsed:
+                parsed = parse_trumba_json(text, feed_url)
+
+        if parsed:
+            logging.info("Parsed %d events from %s", len(parsed), feed_url)
+            events.extend(parsed)
+        else:
+            warnings.append(f"No events parsed from feed: {feed_url}")
+
+    if not events:
+        fallback_pages = [
+            events_url,
+            urljoin(base_url, "/Calendar-of-Events"),
+            urljoin(base_url, "/parks-recreation/events"),
+        ]
+        for page_url in fallback_pages:
+            if page_url in sources_tried:
+                continue
+            sources_tried.append(page_url)
+            parsed = scrape_html_page(session, page_url, timeout)
+            if parsed:
+                logging.info("Parsed %d events from %s", len(parsed), page_url)
+                events.extend(parsed)
+            else:
+                warnings.append(f"No events parsed from HTML page: {page_url}")
+
+    return (dedupe_events(events), warnings, sources_tried)
+
+
+def write_output(
+    path: str,
+    source_url: str,
+    events: list[Event],
+    warnings: list[str] | None = None,
+    sources_tried: list[str] | None = None,
+) -> None:
     payload = {
         "metadata": {
             "source": source_url,
@@ -296,6 +644,10 @@ def write_output(path: str, source_url: str, events: list[Event]) -> None:
         },
         "events": [asdict(event) for event in events],
     }
+    if warnings:
+        payload["metadata"]["warnings"] = warnings
+    if sources_tried:
+        payload["metadata"]["sources_tried"] = sources_tried
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
         f.write("\n")
@@ -352,17 +704,32 @@ def main() -> int:
     days = None if args.days < 0 else args.days
 
     logging.info("Scraping events from %s", events_url)
-
     session = make_session()
+
+    warnings: list[str] = []
+    sources_tried: list[str] = []
+    events: list[Event] = []
     try:
-        events = scrape_events(session, events_url, timeout=args.timeout)
-    except requests.RequestException as exc:
-        logging.error("Failed to scrape events: %s", exc)
-        return 1
+        events, scrape_warnings, sources_tried = scrape_events(
+            session, args.base_url, events_url, timeout=args.timeout
+        )
+        warnings.extend(scrape_warnings)
+    except Exception as exc:
+        logging.exception("Unexpected scraper failure: %s", exc)
+        warnings.append(f"Unexpected scraper failure: {exc}")
 
     events = filter_by_days(events, days)
     events = sort_events(events)
-    write_output(args.output, events_url, events)
+    write_output(
+        args.output,
+        events_url,
+        events,
+        warnings=warnings,
+        sources_tried=sources_tried,
+    )
+
+    if warnings:
+        logging.warning("Completed with %d warning(s)", len(warnings))
     logging.info("Wrote %d events to %s", len(events), args.output)
     return 0
 
