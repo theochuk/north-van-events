@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>North Van Events Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="layout">
+    <header class="header">
+      <p class="kicker">City of North Vancouver</p>
+      <h1>Events Dashboard</h1>
+      <p class="intro">Upcoming events in one fast, filterable view.</p>
+      <div class="meta-row">
+        <span id="updatedAt">Last updated: loading...</span>
+        <span id="totalCount">0 events</span>
+      </div>
+    </header>
+
+    <section class="controls" aria-label="Filters">
+      <label class="field">
+        <span>Search</span>
+        <input id="searchInput" type="search" placeholder="Title, location, category...">
+      </label>
+      <label class="field">
+        <span>Category</span>
+        <select id="categoryFilter">
+          <option value="">All categories</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Location</span>
+        <input id="locationFilter" type="text" placeholder="Filter by location">
+      </label>
+      <label class="field">
+        <span>Date from</span>
+        <input id="dateFrom" type="date">
+      </label>
+      <label class="field">
+        <span>Sort</span>
+        <select id="sortBy">
+          <option value="soonest">Soonest first</option>
+          <option value="latest">Latest first</option>
+          <option value="title">Title (A-Z)</option>
+        </select>
+      </label>
+      <button id="resetButton" type="button" class="btn">Reset</button>
+    </section>
+
+    <section class="stats" aria-label="Summary">
+      <article class="stat">
+        <p class="label">Visible</p>
+        <p id="visibleCount" class="value">0</p>
+      </article>
+      <article class="stat">
+        <p class="label">With Date</p>
+        <p id="datedCount" class="value">0</p>
+      </article>
+      <article class="stat">
+        <p class="label">Categories</p>
+        <p id="categoryCount" class="value">0</p>
+      </article>
+    </section>
+
+    <section id="status" class="status">Loading events...</section>
+    <section id="eventsGrid" class="events-grid" aria-live="polite"></section>
+  </main>
+
+  <script>
+    const state = {
+      rawEvents: [],
+      filteredEvents: [],
+      metadata: null
+    };
+
+    const els = {
+      status: document.getElementById("status"),
+      eventsGrid: document.getElementById("eventsGrid"),
+      updatedAt: document.getElementById("updatedAt"),
+      totalCount: document.getElementById("totalCount"),
+      visibleCount: document.getElementById("visibleCount"),
+      datedCount: document.getElementById("datedCount"),
+      categoryCount: document.getElementById("categoryCount"),
+      searchInput: document.getElementById("searchInput"),
+      categoryFilter: document.getElementById("categoryFilter"),
+      locationFilter: document.getElementById("locationFilter"),
+      dateFrom: document.getElementById("dateFrom"),
+      sortBy: document.getElementById("sortBy"),
+      resetButton: document.getElementById("resetButton")
+    };
+
+    function escapeHtml(str) {
+      return (str ?? "").replace(/[&<>"']/g, c => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      })[c]);
+    }
+
+    function formatDate(isoString) {
+      if (!isoString) return "Date TBA";
+      const d = new Date(isoString);
+      if (Number.isNaN(d.getTime())) return "Date TBA";
+      return new Intl.DateTimeFormat("en-CA", {
+        dateStyle: "medium",
+        timeStyle: "short"
+      }).format(d);
+    }
+
+    function readFilters() {
+      return {
+        q: els.searchInput.value.trim().toLowerCase(),
+        category: els.categoryFilter.value.trim().toLowerCase(),
+        location: els.locationFilter.value.trim().toLowerCase(),
+        dateFrom: els.dateFrom.value ? new Date(`${els.dateFrom.value}T00:00:00`) : null,
+        sortBy: els.sortBy.value
+      };
+    }
+
+    function computeFilteredEvents() {
+      const filters = readFilters();
+      let events = [...state.rawEvents];
+
+      if (filters.q) {
+        events = events.filter(e => {
+          const haystack = [e.title, e.location, e.category, e.summary].join(" ").toLowerCase();
+          return haystack.includes(filters.q);
+        });
+      }
+
+      if (filters.category) {
+        events = events.filter(e => (e.category || "").toLowerCase() === filters.category);
+      }
+
+      if (filters.location) {
+        events = events.filter(e => (e.location || "").toLowerCase().includes(filters.location));
+      }
+
+      if (filters.dateFrom) {
+        events = events.filter(e => {
+          if (!e.start) return false;
+          const date = new Date(e.start);
+          return !Number.isNaN(date.getTime()) && date >= filters.dateFrom;
+        });
+      }
+
+      events.sort((a, b) => {
+        if (filters.sortBy === "title") {
+          return (a.title || "").localeCompare(b.title || "", "en");
+        }
+        const aDate = a.start ? new Date(a.start).getTime() : Number.POSITIVE_INFINITY;
+        const bDate = b.start ? new Date(b.start).getTime() : Number.POSITIVE_INFINITY;
+        if (filters.sortBy === "latest") return bDate - aDate;
+        return aDate - bDate;
+      });
+
+      return events;
+    }
+
+    function updateStats() {
+      const dated = state.filteredEvents.filter(e => Boolean(e.start)).length;
+      const categories = new Set(state.filteredEvents.map(e => e.category).filter(Boolean));
+      els.visibleCount.textContent = String(state.filteredEvents.length);
+      els.datedCount.textContent = String(dated);
+      els.categoryCount.textContent = String(categories.size);
+    }
+
+    function renderEvents() {
+      if (!state.filteredEvents.length) {
+        els.eventsGrid.innerHTML = "";
+        els.status.textContent = "No events match your current filters.";
+        return;
+      }
+      els.status.textContent = `Showing ${state.filteredEvents.length} event(s).`;
+      els.eventsGrid.innerHTML = state.filteredEvents.map(event => {
+        const title = escapeHtml(event.title || "Untitled Event");
+        const location = escapeHtml(event.location || "Location TBA");
+        const category = escapeHtml(event.category || "General");
+        const summary = escapeHtml(event.summary || "No summary available.");
+        const date = escapeHtml(formatDate(event.start));
+        const source = escapeHtml(event.source || "unknown");
+        const link = event.url ? `<a class="event-link" href="${escapeHtml(event.url)}" target="_blank" rel="noopener noreferrer">Open event</a>` : "";
+        return `
+          <article class="event-card">
+            <p class="badge">${category}</p>
+            <h2>${title}</h2>
+            <p class="event-date">${date}</p>
+            <p class="event-location">${location}</p>
+            <p class="event-summary">${summary}</p>
+            <div class="event-footer">
+              <span class="source-pill">Source: ${source}</span>
+              ${link}
+            </div>
+          </article>
+        `;
+      }).join("");
+    }
+
+    function populateCategoryOptions(events) {
+      const categories = [...new Set(events.map(e => e.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, "en"));
+      const options = ['<option value="">All categories</option>']
+        .concat(categories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`))
+        .join("");
+      els.categoryFilter.innerHTML = options;
+    }
+
+    function applyFiltersAndRender() {
+      state.filteredEvents = computeFilteredEvents();
+      renderEvents();
+      updateStats();
+    }
+
+    function bindUi() {
+      [els.searchInput, els.categoryFilter, els.locationFilter, els.dateFrom, els.sortBy]
+        .forEach(el => el.addEventListener("input", applyFiltersAndRender));
+      els.resetButton.addEventListener("click", () => {
+        els.searchInput.value = "";
+        els.categoryFilter.value = "";
+        els.locationFilter.value = "";
+        els.dateFrom.value = "";
+        els.sortBy.value = "soonest";
+        applyFiltersAndRender();
+      });
+    }
+
+    async function loadEvents() {
+      try {
+        const res = await fetch("./events.json", { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error(`Failed to load events.json (${res.status})`);
+        }
+        const payload = await res.json();
+        state.rawEvents = Array.isArray(payload.events) ? payload.events : [];
+        state.metadata = payload.metadata || null;
+
+        if (state.metadata?.scraped_at) {
+          els.updatedAt.textContent = `Last updated: ${formatDate(state.metadata.scraped_at)}`;
+        } else {
+          els.updatedAt.textContent = "Last updated: unknown";
+        }
+        els.totalCount.textContent = `${state.rawEvents.length} total events`;
+
+        populateCategoryOptions(state.rawEvents);
+        applyFiltersAndRender();
+      } catch (err) {
+        els.status.textContent = `Unable to load events data: ${err.message}`;
+      }
+    }
+
+    bindUi();
+    loadEvents();
+  </script>
+</body>
+</html>
