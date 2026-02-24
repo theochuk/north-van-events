@@ -1,0 +1,54 @@
+{
+  "events": [
+    {
+      "title": "North Van Community Market",
+      "start": "2026-03-01T10:00:00-08:00",
+      "end": "2026-03-01T14:00:00-08:00",
+      "location": "Lonsdale Quay",
+      "category": "Market",
+      "description": "Weekly farmers market featuring local vendors, fresh produce, and artisan goods.",
+      "url": "https://www.cnv.org/events"
+    },
+    {
+      "title": "Family Swim Night",
+      "start": "2026-02-28T18:00:00-08:00",
+      "end": "2026-02-28T20:00:00-08:00",
+      "location": "Ron Andrews Recreation Centre",
+      "category": "Recreation",
+      "description": "Open swim for families. Bring the kids for an evening of fun in the pool.",
+      "url": "https://www.cnv.org/events"
+    },
+    {
+      "title": "Arts Council Exhibition Opening",
+      "start": "2026-03-05T19:00:00-08:00",
+      "end": "2026-03-05T21:00:00-08:00",
+      "location": "Presentation House Gallery",
+      "category": "Arts",
+      "description": "Opening reception for new contemporary art exhibition featuring local artists.",
+      "url": "https://www.cnv.org/events"
+    },
+    {
+      "title": "Trail Maintenance Workshop",
+      "start": "2026-03-08T09:00:00-08:00",
+      "end": "2026-03-08T12:00:00-08:00",
+      "location": "Lynn Canyon Park",
+      "category": "Environment",
+      "description": "Volunteer opportunity to learn trail maintenance techniques and help preserve local trails.",
+      "url": "https://www.cnv.org/events"
+    },
+    {
+      "title": "Spring Garden Workshop",
+      "start": "2026-03-15T13:00:00-07:00",
+      "end": "2026-03-15T15:00:00-07:00",
+      "location": "Delbrook Community Centre",
+      "category": "Education",
+      "description": "Learn how to prepare your garden for spring planting. Free workshop with expert gardeners.",
+      "url": "https://www.cnv.org/events"
+    }
+  ],
+  "metadata": {
+    "scraped_at": "2026-02-23T21:40:00-08:00",
+    "source": "Demo data - DNS limitations prevent real scraping from this location",
+    "count": 5
+  }
+}
